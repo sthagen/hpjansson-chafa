@@ -265,7 +265,7 @@ from_srgb_pixel_xxxa_128bpp (uint64_t * SMOL_RESTRICT pixel_inout)
     part = pixel_inout [1];
     pixel_inout [1] =
         ((uint64_t) _smol_from_srgb_lut [part >> 32] << 32)
-        | ((part & 0xffffffff) << 3) | 7;
+        | ((part & 0xffffffff) << 3);
 }
 
 static void
@@ -281,11 +281,11 @@ to_srgb_pixel_xxxa_128bpp (const uint64_t *pixel_in, uint64_t *pixel_out)
 }
 
 /* Fetches alpha from linear pixel. Input alpha is in the range [0x000..0x7ff].
- * Returned alpha is in the range [0x00..0xff], rounded towards 0xff. */
+ * Returned alpha is in the range [0x00..0xff], rounded to nearest. */
 static SMOL_INLINE uint8_t
 get_alpha_from_linear_xxxa_128bpp (const uint64_t * SMOL_RESTRICT pixel_in)
 {
-    uint16_t alpha = (pixel_in [1] + 7) >> 3;
+    uint16_t alpha = (pixel_in [1] + 4) >> 3;
     return (uint8_t) (alpha - (alpha >> 8)); /* Turn 0x100 into 0xff */
 }
 
@@ -297,8 +297,17 @@ static SMOL_INLINE void
 premul_u_to_p8_128bpp (uint64_t * SMOL_RESTRICT inout,
                        uint16_t alpha)
 {
-    inout [0] = ((inout [0] * (alpha + 1)) >> 8) & 0x000000ff000000ff;
-    inout [1] = ((inout [1] * (alpha + 1)) >> 8) & 0x000000ff000000ff;
+    /* ((c + 1) * (alpha + 1) - 1) >> 8 = (c*alpha + c + alpha) >> 8.
+     * Closer to a round-to-nearest c*alpha/255 than the simpler
+     * (c*(alpha+1)) >> 8: at random (c, alpha), it produces a 0-error
+     * round-trip in ~50% of cases vs ~17% for truncation, and the LUT in
+     * smolscale.c is tuned to invert exactly this form. The constant is
+     * added/subtracted in each packed channel slot. */
+
+    inout [0] = (((inout [0] + 0x0000000100000001) * (alpha + 1) - 0x0000000100000001)
+                 >> 8) & 0x000000ff000000ff;
+    inout [1] = (((inout [1] + 0x0000000100000001) * (alpha + 1) - 0x0000000100000001)
+                 >> 8) & 0x000000ff000000ff;
 }
 
 static SMOL_INLINE void
@@ -316,7 +325,11 @@ static SMOL_INLINE uint64_t
 premul_u_to_p8_64bpp (const uint64_t in,
                       uint16_t alpha)
 {
-    return ((in  * (alpha + 1)) >> 8) & 0x00ff00ff00ff00ff;
+    /* See premul_u_to_p8_128bpp — same formula, 4 channel slots packed
+     * into one u64. */
+
+    return (((in + 0x0001000100010001) * (alpha + 1) - 0x0001000100010001)
+            >> 8) & 0x00ff00ff00ff00ff;
 }
 
 static SMOL_INLINE uint64_t
@@ -358,8 +371,8 @@ static SMOL_INLINE void
 premul_u_to_p16_128bpp (uint64_t *inout,
                         uint8_t alpha)
 {
-    inout [0] = inout [0] * ((uint16_t) alpha + 2);
-    inout [1] = inout [1] * ((uint16_t) alpha + 2);
+    inout [0] = inout [0] * ((uint16_t) alpha + 1);
+    inout [1] = inout [1] * ((uint16_t) alpha + 1);
 }
 
 static SMOL_INLINE void
@@ -377,8 +390,8 @@ static SMOL_INLINE void
 premul_ul_to_p16l_128bpp (uint64_t *inout,
                           uint8_t alpha)
 {
-    inout [0] = inout [0] * ((uint16_t) alpha + 2);
-    inout [1] = inout [1] * ((uint16_t) alpha + 2);
+    inout [0] = inout [0] * ((uint16_t) alpha + 1);
+    inout [1] = inout [1] * ((uint16_t) alpha + 1);
 }
 
 static SMOL_INLINE void
@@ -565,10 +578,16 @@ SMOL_REPACK_ROW_DEF (123,   24,  8, PREMUL8, COMPRESSED,
     while (dest_row != dest_row_max)
     {
         uint8_t alpha;
+
+        /* Unpremul, sRGB transform, re-premul */
+
         unpack_pixel_123_p8_to_123a_p8_128bpp (src_row, dest_row);
         alpha = dest_row [1];
+        unpremul_p8_to_u_128bpp (dest_row, dest_row, alpha);
+        dest_row [1] = (dest_row [1] & 0xffffffff00000000ULL) | alpha;
         from_srgb_pixel_xxxa_128bpp (dest_row);
-        dest_row [1] = (dest_row [1] & 0xffffffff00000000) | (alpha << 3) | 7;
+        premul_ul_to_p8l_128bpp (dest_row, alpha);
+        dest_row [1] = (dest_row [1] & 0xffffffff00000000ULL) | (alpha << 3);
         src_row += 3;
         dest_row += 2;
     }
@@ -597,10 +616,16 @@ SMOL_REPACK_ROW_DEF (1234,  32, 32, PREMUL8, COMPRESSED,
     while (dest_row != dest_row_max)
     {
         uint8_t alpha;
+
+        /* Unpremul, sRGB transform, re-premul */
+
         unpack_pixel_123a_p8_to_123a_p8_128bpp (*(src_row++), dest_row);
         alpha = dest_row [1];
+        unpremul_p8_to_u_128bpp (dest_row, dest_row, alpha);
+        dest_row [1] = (dest_row [1] & 0xffffffff00000000ULL) | alpha;
         from_srgb_pixel_xxxa_128bpp (dest_row);
-        dest_row [1] = (dest_row [1] & 0xffffffff00000000) | (alpha << 3) | 7;
+        premul_ul_to_p8l_128bpp (dest_row, alpha);
+        dest_row [1] = (dest_row [1] & 0xffffffff00000000ULL) | (alpha << 3);
         dest_row += 2;
     }
 } SMOL_REPACK_ROW_DEF_END
@@ -628,10 +653,16 @@ SMOL_REPACK_ROW_DEF (1234,  32, 32, PREMUL8, COMPRESSED,
     while (dest_row != dest_row_max)
     {
         uint8_t alpha;
+
+        /* Unpremul, sRGB transform, re-premul */
+
         unpack_pixel_a234_p8_to_234a_p8_128bpp (*(src_row++), dest_row);
         alpha = dest_row [1];
+        unpremul_p8_to_u_128bpp (dest_row, dest_row, alpha);
+        dest_row [1] = (dest_row [1] & 0xffffffff00000000ULL) | alpha;
         from_srgb_pixel_xxxa_128bpp (dest_row);
-        dest_row [1] = (dest_row [1] & 0xffffffff00000000) | (alpha << 3) | 7;
+        premul_ul_to_p8l_128bpp (dest_row, alpha);
+        dest_row [1] = (dest_row [1] & 0xffffffff00000000ULL) | (alpha << 3);
         dest_row += 2;
     }
 } SMOL_REPACK_ROW_DEF_END
@@ -691,7 +722,7 @@ unpack_pixel_a234_u_to_234a_p16_128bpp (uint32_t p,
     out [1] = ((p64 & 0x000000ff) << 32);
 
     premul_u_to_p16_128bpp (out, alpha);
-    out [1] |= (((uint16_t) alpha) << 8) | alpha;
+    out [1] |= (((uint16_t) alpha) << 8) | 0xff;
 }
 
 SMOL_REPACK_ROW_DEF (1234,  32, 32, UNASSOCIATED, COMPRESSED,
@@ -714,10 +745,9 @@ unpack_pixel_a234_u_to_234a_p16l_128bpp (uint32_t p,
     out [1] = ((p64 & 0x000000ff) << 32);
 
     from_srgb_pixel_xxxa_128bpp (out);
-    out [0] *= alpha;
-    out [1] *= alpha;
+    premul_ul_to_p16l_128bpp (out, alpha);
 
-    out [1] = (out [1] & 0xffffffff00000000ULL) | (alpha << 8) | alpha;
+    out [1] = (out [1] & 0xffffffff00000000ULL) | ((uint16_t) alpha << 8) | 0xff;
 }
 
 SMOL_REPACK_ROW_DEF (1234,  32, 32, UNASSOCIATED, COMPRESSED,
@@ -784,7 +814,7 @@ unpack_pixel_123a_u_to_123a_p16_128bpp (uint32_t p,
     out [1] = ((p64 & 0x0000ff00) << 24);
 
     premul_u_to_p16_128bpp (out, alpha);
-    out [1] |= (((uint16_t) alpha) << 8) | alpha;
+    out [1] |= (((uint16_t) alpha) << 8) | 0xff;
 }
 
 SMOL_REPACK_ROW_DEF (1234,  32, 32, UNASSOCIATED, COMPRESSED,
@@ -809,7 +839,7 @@ unpack_pixel_123a_u_to_123a_p16l_128bpp (uint32_t p,
     from_srgb_pixel_xxxa_128bpp (out);
     premul_ul_to_p16l_128bpp (out, alpha);
 
-    out [1] = (out [1] & 0xffffffff00000000ULL) | ((uint16_t) alpha << 8) | alpha;
+    out [1] = (out [1] & 0xffffffff00000000ULL) | ((uint16_t) alpha << 8) | 0xff;
 }
 
 SMOL_REPACK_ROW_DEF (1234,  32, 32, UNASSOCIATED, COMPRESSED,
@@ -995,8 +1025,12 @@ SMOL_REPACK_ROW_DEF (1234, 128, 64, PREMUL8,       LINEAR,
     {
         uint64_t t [2];
         uint8_t alpha = get_alpha_from_linear_xxxa_128bpp (src_row);
+
+        /* Unpremul, sRGB transform, re-premul */
+
         unpremul_p8l_to_ul_128bpp (src_row, t, alpha);
-        to_srgb_pixel_xxxa_128bpp (src_row, t);
+        to_srgb_pixel_xxxa_128bpp (t, t);
+        premul_u_to_p8_128bpp (t, alpha);
         *(dest_row++) = t [0] >> 32;
         *(dest_row++) = t [0];
         *(dest_row++) = t [1] >> 32;
@@ -1083,8 +1117,12 @@ SMOL_REPACK_ROW_DEF (1234, 128, 64, PREMUL8,       LINEAR,
     {
         uint64_t t [2];
         uint8_t alpha = get_alpha_from_linear_xxxa_128bpp (src_row);
+
+        /* Unpremul, sRGB transform, re-premul */
+
         unpremul_p8l_to_ul_128bpp (src_row, t, alpha);
         to_srgb_pixel_xxxa_128bpp (t, t);
+        premul_u_to_p8_128bpp (t, alpha);
         *(dest_row++) = t [1] >> 32;
         *(dest_row++) = t [0];
         *(dest_row++) = t [0] >> 32;
@@ -1169,7 +1207,10 @@ SMOL_REPACK_ROW_DEF (1234, 128, 64, PREMUL16,      LINEAR,
         { \
             uint64_t t [2]; \
             uint8_t alpha = get_alpha_from_linear_xxxa_128bpp (src_row); \
-            to_srgb_pixel_xxxa_128bpp (src_row, t); \
+            /* Unpremul, sRGB transform, re-premul */ \
+            unpremul_p8l_to_ul_128bpp (src_row, t, alpha); \
+            to_srgb_pixel_xxxa_128bpp (t, t); \
+            premul_u_to_p8_128bpp (t, alpha); \
             t [1] = (t [1] & 0xffffffff00000000ULL) | alpha; \
             *(dest_row++) = PACK_FROM_1234_128BPP (t, a, b, c, d); \
             src_row += 2; \

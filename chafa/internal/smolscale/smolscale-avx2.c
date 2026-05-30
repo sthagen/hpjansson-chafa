@@ -348,8 +348,10 @@ static SMOL_INLINE void
 premul_u_to_p16_128bpp (uint64_t *inout,
                         uint8_t alpha)
 {
-    inout [0] = inout [0] * alpha;
-    inout [1] = inout [1] * alpha;
+    /* (alpha + 1) keeps RGB recoverable when alpha=0; matches the LUT in
+     * smolscale.c (ceil (2^16 / (alpha + 1))) so the round-trip is exact. */
+    inout [0] = inout [0] * ((uint16_t) alpha + 1);
+    inout [1] = inout [1] * ((uint16_t) alpha + 1);
 }
 
 static SMOL_INLINE void
@@ -613,12 +615,15 @@ unpack_8x_xxxx_u_to_123a_p16_128bpp (const uint32_t * SMOL_RESTRICT *in,
     const __m256i factor_shuf = _mm256_set_epi8 (
         -1, 12, -1, -1, -1, 12, -1, 12,  -1, 4, -1, -1, -1, 4, -1, 4,
         -1, 12, -1, -1, -1, 12, -1, 12,  -1, 4, -1, -1, -1, 4, -1, 4);
-    const __m256i alpha_mul = _mm256_set_epi16 (
-        0, 0x100, 0, 0,  0, 0x100, 0, 0,
-        0, 0x100, 0, 0,  0, 0x100, 0, 0);
-    const __m256i alpha_add = _mm256_set_epi16 (
-        0, 0x80, 0, 0,  0, 0x80, 0, 0,
-        0, 0x80, 0, 0,  0, 0x80, 0, 0);
+    /* 1 at every non-alpha slot, 0x100 at every alpha slot. */
+    const __m256i alpha_combine = _mm256_set_epi16 (
+        1, 0x100, 1, 1,  1, 0x100, 1, 1,
+        1, 0x100, 1, 1,  1, 0x100, 1, 1);
+    /* 0xff at every alpha slot, 0 elsewhere. OR'd in after the multiply
+     * to set the low byte of the alpha encoding. */
+    const __m256i alpha_lowbyte = _mm256_set_epi16 (
+        0, 0xff, 0, 0,  0, 0xff, 0, 0,
+        0, 0xff, 0, 0,  0, 0xff, 0, 0);
     const __m256i * SMOL_RESTRICT my_in = (const __m256i * SMOL_RESTRICT) *in;
     __m256i * SMOL_RESTRICT my_out = (__m256i * SMOL_RESTRICT) *out;
     __m256i m0, m1, m2, m3, m4, m5, m6;
@@ -640,14 +645,14 @@ unpack_8x_xxxx_u_to_123a_p16_128bpp (const uint32_t * SMOL_RESTRICT *in,
         fact1 = _mm256_shuffle_epi8 (m1, factor_shuf);
         fact2 = _mm256_shuffle_epi8 (m2, factor_shuf);
 
-        fact1 = _mm256_or_si256 (fact1, alpha_mul);
-        fact2 = _mm256_or_si256 (fact2, alpha_mul);
+        fact1 = _mm256_add_epi16 (fact1, alpha_combine);
+        fact2 = _mm256_add_epi16 (fact2, alpha_combine);
 
         m1 = _mm256_mullo_epi16 (m1, fact1);
         m2 = _mm256_mullo_epi16 (m2, fact2);
 
-        m1 = _mm256_add_epi16 (m1, alpha_add);
-        m2 = _mm256_add_epi16 (m2, alpha_add);
+        m1 = _mm256_or_si256 (m1, alpha_lowbyte);
+        m2 = _mm256_or_si256 (m2, alpha_lowbyte);
 
         m1 = _mm256_permute4x64_epi64 (m1, SMOL_4X2BIT (3, 1, 2, 0));
         m2 = _mm256_permute4x64_epi64 (m2, SMOL_4X2BIT (3, 1, 2, 0));
@@ -752,9 +757,10 @@ unpack_pixel_a234_u_to_234a_p16_128bpp (uint32_t p,
 {
     uint64_t p64 = p;
     uint64_t alpha = p >> 24;
+    uint64_t mul = alpha + 1;
 
-    out [0] = (((((p64 & 0x00ff0000) << 16) | ((p64 & 0x0000ff00) >> 8)) * alpha));
-    out [1] = (((((p64 & 0x000000ff) << 32) * alpha))) | (alpha << 8) | 0x80;
+    out [0] = (((p64 & 0x00ff0000) << 16) | ((p64 & 0x0000ff00) >> 8)) * mul;
+    out [1] = ((p64 & 0x000000ff) << 32) * mul | (alpha << 8) | 0xff;
 }
 
 SMOL_REPACK_ROW_DEF (1234,  32, 32, UNASSOCIATED, COMPRESSED,
@@ -797,9 +803,10 @@ unpack_pixel_123a_u_to_123a_p16_128bpp (uint32_t p,
 {
     uint64_t p64 = p;
     uint64_t alpha = p & 0xff;
+    uint64_t mul = alpha + 1;
 
-    out [0] = (((((p64 & 0xff000000) << 8) | ((p64 & 0x00ff0000) >> 16)) * alpha));
-    out [1] = (((((p64 & 0x0000ff00) << 24) * alpha))) | (alpha << 8) | 0x80;
+    out [0] = (((p64 & 0xff000000) << 8) | ((p64 & 0x00ff0000) >> 16)) * mul;
+    out [1] = ((p64 & 0x0000ff00) << 24) * mul | (alpha << 8) | 0xff;
 }
 
 SMOL_REPACK_ROW_DEF (1234,  32, 32, UNASSOCIATED, COMPRESSED,
